@@ -733,6 +733,7 @@ static void show_settings_page() {
 
   int sel = 0;
   bool dirty = true;
+  bool first_paint = true;
   unsigned long last_input = 0;
 
   const int CARD_X = 10;
@@ -742,8 +743,14 @@ static void show_settings_page() {
 
   for (;;) {
     if (dirty) {
-      tft.fillScreen(UI_BG);
-      draw_cn_center(18, TXT_SETTINGS[ui_lang], UI_TXT, UI_BG);
+      // 只有第一次进来才全屏清一次；之后调值/换选项只重绘两行卡片，
+      // 否则每按一下都全屏重绘（115KB / 约 23ms）会明显闪。
+      if (first_paint) {
+        tft.fillScreen(UI_BG);
+        draw_cn_center(18, TXT_SETTINGS[ui_lang], UI_TXT, UI_BG);
+        // 底部提示在语言切换后也要重画，所以不放 first_paint 里
+        first_paint = false;
+      }
 
       for (int i = 0; i < 2; i++) {
         int y = ROW_Y0 + i * ROW_H;
@@ -771,6 +778,8 @@ static void show_settings_page() {
         draw_cn_text(CARD_X + CARD_W - 16 - vw, y + 9, val, on ? UI_ACCENT : UI_TXT2, bg);
       }
 
+      // 底部提示用背景色覆盖再写（语言可能刚被切换）
+      tft.drawFilledRect(0, DISPLAY_HEIGHT - 52, DISPLAY_WIDTH, 52, UI_BG);
       draw_cn_center(DISPLAY_HEIGHT - 46, TXT_HINT_CFG[ui_lang], UI_TXT2, UI_BG);
       draw_cn_center(DISPLAY_HEIGHT - 26, TXT_HINT_SEL[ui_lang], UI_TXT2, UI_BG);
       dirty = false;
@@ -818,7 +827,8 @@ static void show_settings_page() {
           if (!(nes_get_gamepad_state() & HW_MASK_SELECT)) break;
           delay(20);
         }
-        tft.fillScreen(UI_BG);
+        // 不在这里清屏：show_menu() 的 needs_full_redraw 会统一重绘一次，
+        // 两次 fillScreen 会让页面切换看起来"闪一下"。
         Serial.printf("[MENU] settings closed (lang=%d vol=%d)\n",
                       (int)ui_lang, menu_volume);
         return;
