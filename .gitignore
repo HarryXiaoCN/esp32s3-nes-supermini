@@ -33,3 +33,18 @@ desktop.ini
 
 # ---- 本地调试开关（不参与版本管理） ----
 firmware/build_opt.h
+
+# ---- Python 缓存 ----
+__pycache__/
+*.pyc
+
+# ---- MP3 benchmark 的测试数据（用 tools/mp3_bench/make_test_clip.ps1 重新生成） ----
+tools/mp3_bench/test.mp3
+tools/mp3_bench/test_mp3.h
+tools/mp3_bench/build/
+
+# ---- SD 卡写卡工具的构建产物 ----
+tools/sd_put/build/
+tools/sd_put/build.log
+
+src/cn_font.h.bak
