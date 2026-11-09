@@ -1,0 +1,35 @@
+# ---- 游戏 ROM：有版权风险，绝不能提交 ----
+*.nes
+*.NES
+*.unf
+*.unif
+roms/
+games/
+
+# ---- 第三方字体 / 自动生成的字库：不可再分发 ----
+*.ttf
+*.ttc
+*.otf
+*.woff
+src/cn_font.h
+
+# ---- 构建产物 ----
+firmware/build/
+build/
+*.bin
+*.elf
+*.map
+*.hex
+sdkconfig
+sdkconfig.old
+.pio/
+
+# ---- 编辑器 / 系统 ----
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ---- 本地调试开关（不参与版本管理） ----
+firmware/build_opt.h
