@@ -27,11 +27,16 @@
 #define ST7789_ROW_OFFSET 0
 
 // 屏幕 SPI 时钟。整帧 115200 字节：80MHz 约 11.5ms，40MHz 约 23ms。
-// 本版本屏幕和 SD 卡共享 SCK/MOSI，总线上多挂了一个 SD 卡座（长杜邦线 + 卡座电容），
-// 80MHz 很容易花屏，所以默认 40MHz。屏幕单独走线、确认稳定后可以
-// 在编译选项里加 -DTFT_SPI_FREQ=80000000 提回 80MHz。
+//
+// 屏幕和 SD 卡共享 SCK/MOSI，但两者**从不同时占用总线**：屏幕用自己的
+// SPISettings(本值)，SD 库每次读写用自己的 SPISettings(20MHz)，谁操作谁设时钟，
+// 所以提高屏幕时钟不会影响 SD 卡的稳定性。
+//
+// 默认 80MHz（ESP32-S3 SPI 主机的硬件上限，再高驱动会自动钳到 80）。
+// 设置页「屏幕」一栏可以切回 40MHz 并存 NVS；80MHz 是否稳跑取决于走线质量。
+// 万一花屏到看不清菜单：**开机时按住 B 键**会强制回到 40MHz。
 #ifndef TFT_SPI_FREQ
-#define TFT_SPI_FREQ 40000000
+#define TFT_SPI_FREQ 80000000
 #endif
 
 // 单次 SPI 传输的像素块大小（4096 像素 = 8KB）。原来 512 像素一块，
@@ -168,9 +173,13 @@ private:
     // SPIClass 的时钟/模式是总线级状态：SD 库内部用
     // beginTransaction(SPISettings(400kHz/20MHz, ...)) 包住每次读写，
     // 屏幕这边也必须同样用事务包住每次访问。否则 SD 卡一操作，
-    // 屏幕残留的 40MHz 配置就被改掉；反过来屏幕也会破坏 SD 的时钟。
-    static void bus_begin() {
-        SPI.beginTransaction(SPISettings(TFT_SPI_FREQ, MSBFIRST, SPI_MODE0));
+    // 屏幕残留的时钟配置就被改掉；反过来屏幕也会破坏 SD 的时钟。
+    //
+    // 时钟值放在成员变量里（不是编译期常量），设置页可以在运行时切 40/80MHz。
+    uint32_t spi_hz = TFT_SPI_FREQ;
+
+    void bus_begin() {
+        SPI.beginTransaction(SPISettings(spi_hz, MSBFIRST, SPI_MODE0));
     }
     static void bus_end() {
         SPI.endTransaction();
@@ -213,8 +222,43 @@ private:
         raw_cmd(TFT_RASET); raw_word((uint16_t)y0); raw_word((uint16_t)y1);
         raw_cmd(TFT_RAMWR);
     }
+
+    // 把当前窗口里的 pixels 个像素全部刷成同色。调用前必须已经 set_window()。
+    //
+    // 【为什么不用逐像素 SPI.write16()】原来 drawFilledRect 是 for 循环逐像素写，
+    // 每个像素两次寄存器级 SPI 写：菜单一整行底 6912 像素 = 13824 次写，
+    // 整卡 32800 像素 = 65600 次。改成先把 1KB 的块填好再 writeBytes() 整块发，
+    // CPU 只在颜色变化时填一次块，其余时间交给 SPI FIFO/DMA。
+    void fill_pixels(uint16_t color, uint32_t pixels) {
+        static uint8_t block[1024];
+        static uint16_t cached_color = 0;
+        static bool cached_ok = false;
+
+        // 一次重绘里同一种颜色通常连刷很多块（卡片底、行底、分隔线），缓存住。
+        if (!cached_ok || cached_color != color) {
+            uint8_t hi = (uint8_t)(color >> 8);
+            uint8_t lo = (uint8_t)(color & 0xFF);
+            for (int i = 0; i < 1024; i += 2) {
+                block[i]     = hi;
+                block[i + 1] = lo;
+            }
+            cached_color = color;
+            cached_ok = true;
+        }
+
+        uint32_t remaining = pixels * 2;
+        while (remaining > 0) {
+            uint32_t n = (remaining > sizeof(block)) ? sizeof(block) : remaining;
+            SPI.writeBytes(block, n);
+            remaining -= n;
+        }
+    }
   public:
     TFTDriver() {}
+
+    // 屏幕 SPI 时钟（Hz）。改完立即生效：下一次 bus_begin() 就用新值。
+    void set_spi_freq(uint32_t hz) { spi_hz = hz; }
+    uint32_t spi_freq() const { return spi_hz; }
     
     void init() {
         pinMode(TFT_DC, OUTPUT);
@@ -283,22 +327,9 @@ private:
                    ST7789_ROW_OFFSET,
                    ST7789_COL_OFFSET + DISPLAY_WIDTH - 1,
                    ST7789_ROW_OFFSET + DISPLAY_HEIGHT - 1);
-        
-        uint32_t pixel_count = (uint32_t)DISPLAY_WIDTH * DISPLAY_HEIGHT;
-        static uint8_t buffer[512];  
-         
-        uint8_t high = color >> 8;
-        uint8_t low = color & 0xFF;
-        for (int i = 0; i < 512; i += 2) {
-            buffer[i] = high;
-            buffer[i + 1] = low;
-        }
-         
-        for (uint32_t i = 0; i < pixel_count; i += 256) {
-            uint32_t chunk_size = (pixel_count - i > 256) ? 256 : (pixel_count - i);
-            SPI.writeBytes(buffer, chunk_size * 2);
-        }
-        
+
+        fill_pixels(color, (uint32_t)DISPLAY_WIDTH * DISPLAY_HEIGHT);
+
         raw_end();
         bus_end();
     }
@@ -344,6 +375,28 @@ private:
         raw_end();
         bus_end();
     } 
+    // 和 pushImage 一样，但数据已经是 SPI 字节序（高字节在前），直接整块发给面板。
+    // 用于文字条带这类"CPU 按字节拼好、无需再转换"的内部 RAM 缓冲。
+    void pushImageBytes(int x, int y, int w, int h, const uint8_t *data) {
+        bus_begin();
+        set_window(x + ST7789_COL_OFFSET,
+                   y + ST7789_ROW_OFFSET,
+                   x + w - 1 + ST7789_COL_OFFSET,
+                   y + h - 1 + ST7789_ROW_OFFSET);
+
+        uint32_t pixel_count = (uint32_t)w * h;
+        for (uint32_t i = 0; i < pixel_count; i += TFT_SPI_CHUNK_PIXELS) {
+            uint32_t chunk = pixel_count - i;
+            if (chunk > TFT_SPI_CHUNK_PIXELS) {
+                chunk = TFT_SPI_CHUNK_PIXELS;
+            }
+            SPI.writeBytes(data + i * 2, chunk * 2);
+        }
+
+        raw_end();
+        bus_end();
+    }
+
     // ---- 整帧连续写入模式 ----
     // 设置一次显示窗口，之后连续 writePixels 即可：ST7789 的写入地址会自动递增，
     // 省掉每块都重发 CASET/RASET/RAMWR 的开销。
@@ -409,13 +462,9 @@ private:
                    y0 + ST7789_ROW_OFFSET,
                    x1 + ST7789_COL_OFFSET,
                    y1 + ST7789_ROW_OFFSET);
-         
-        uint32_t pixels = (uint32_t)clipped_w * clipped_h;
-         
-        for (uint32_t i = 0; i < pixels; i++) {
-             SPI.write16(color);
-        }
-         
+
+        fill_pixels(color, (uint32_t)clipped_w * clipped_h);
+
         raw_end();
         bus_end();
     }

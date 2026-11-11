@@ -129,29 +129,36 @@ const char *mp3_name(int i) {
 }
 
 // ============================================================================
-// 输出端处理：二阶高通 + 削顶统计
+// 输出端处理：音色滤波（高通 + 可选低通）+ 削顶统计
 // ============================================================================
 //
-// 【为什么加高通】这个尺寸的喇叭 200Hz 以下基本没有声压输出，但 D 类功放
-// （MAX98357A，9dB 固定增益）仍然要为那一段低频输出电流，这部分能量全变成热。
-// 结果是中高频的动态余量被吃掉 —— 听感正是"中低音还行、高音糊"。
-// 把喇叭放不出的频段滤掉，中高频就干净了。
+// 三档音色（设置页可选；只作用于 MP3，游戏音效不走这条链）：
+//   0 直通 —— 不滤波。留这一档才能听出"滤波到底改变了什么"，不是凑数
+//   1 默认 —— 180Hz 二阶高通：小喇叭 200Hz 以下基本没有声压输出，但 D 类功放
+//             （MAX98357A，9dB 固定增益）仍要为那段低频输出电流，能量全变成热，
+//             滤掉能给中高频腾出一点动态余量
+//   2 柔和 —— 默认 + 8kHz 二阶低通：高音发毛/刺时用它换柔顺，代价是镲片变糊
 //
-// 注意：高通转折 180Hz 在通带内增益是 1.0，不会让整体音量变小。
+// 两个都是 RBJ cookbook 二阶（Q=0.7071，Butterworth），通带增益 1.0，
+// 切档不会让整体音量跳变（切档瞬间可能有轻微咔哒，属于可接受范围）。
 
 #define HP_FC_HZ 180.0f
+#define LP_FC_HZ 8000.0f
 
-typedef struct { float z1, z2; } hp_state_t;
+typedef struct { float z1, z2; } bq_state_t;
 
 static float s_hp_b0, s_hp_b1, s_hp_b2, s_hp_a1, s_hp_a2;
-static hp_state_t s_hp_l, s_hp_r;
-static bool s_hp_ready = false;
-static int  s_hp_fs    = 0;
+static bq_state_t s_hp_l, s_hp_r;
+static float s_lp_b0, s_lp_b1, s_lp_b2, s_lp_a1, s_lp_a2;
+static bq_state_t s_lp_l, s_lp_r;
+static bool s_tone_ready = false;
+static int  s_tone_fs    = 0;
+static volatile int s_tone_mode = MP3_TONE_DEFAULT;
 static volatile int32_t s_peak = 0;      // 本次播放的最大 |样本|，用于判断是否削顶
 
-// RBJ cookbook 二阶高通（Q=0.7071，Butterworth）
-static void hp_init(int fs) {
-  const float fc = HP_FC_HZ;
+// RBJ cookbook 二阶：type 0 = 高通，1 = 低通
+static void bq_design(int fs, float fc, int type,
+                      float *b0, float *b1, float *b2, float *a1, float *a2) {
   const float q  = 0.7071f;
   const float w0 = 2.0f * (float)M_PI * fc / (float)fs;
   const float cw = cosf(w0);
@@ -159,24 +166,35 @@ static void hp_init(int fs) {
   const float alpha = sw / (2.0f * q);
   const float a0 = 1.0f + alpha;
 
-  s_hp_b0 = ((1.0f + cw) * 0.5f) / a0;
-  s_hp_b1 = -(1.0f + cw) / a0;
-  s_hp_b2 = s_hp_b0;
-  s_hp_a1 = (-2.0f * cw) / a0;
-  s_hp_a2 = (1.0f - alpha) / a0;
+  if (type == 0) {                       // high-pass
+    *b0 = ((1.0f + cw) * 0.5f) / a0;
+    *b1 = -(1.0f + cw) / a0;
+  } else {                               // low-pass
+    *b0 = ((1.0f - cw) * 0.5f) / a0;
+    *b1 = (1.0f - cw) / a0;
+  }
+  *b2 = *b0;
+  *a1 = (-2.0f * cw) / a0;
+  *a2 = (1.0f - alpha) / a0;
+}
 
-  s_hp_l.z1 = s_hp_l.z2 = 0.0f;
-  s_hp_r.z1 = s_hp_r.z2 = 0.0f;
-  s_hp_ready = true;
+static void tone_init(int fs) {
+  bq_design(fs, HP_FC_HZ, 0, &s_hp_b0, &s_hp_b1, &s_hp_b2, &s_hp_a1, &s_hp_a2);
+  bq_design(fs, LP_FC_HZ, 1, &s_lp_b0, &s_lp_b1, &s_lp_b2, &s_lp_a1, &s_lp_a2);
+  s_hp_l.z1 = s_hp_l.z2 = s_hp_r.z1 = s_hp_r.z2 = 0.0f;
+  s_lp_l.z1 = s_lp_l.z2 = s_lp_r.z1 = s_lp_r.z2 = 0.0f;
+  s_tone_ready = true;
 
-  Serial.printf("[MP3] high-pass %.0f Hz @ %d Hz\n", fc, fs);
+  Serial.printf("[MP3] tone HP %.0f Hz / LP %.0f Hz @ %d Hz (mode %d)\n",
+                (double)HP_FC_HZ, (double)LP_FC_HZ, fs, (int)s_tone_mode);
 }
 
 // Transposed Direct Form II：每样本 1 次乘加链，FPU 跑得动
-static inline float hp_tick(hp_state_t *s, float x) {
-  float y = s_hp_b0 * x + s->z1;
-  s->z1 = s_hp_b1 * x - s_hp_a1 * y + s->z2;
-  s->z2 = s_hp_b2 * x - s_hp_a2 * y;
+static inline float bq_tick(bq_state_t *s, float x,
+                            float b0, float b1, float b2, float a1, float a2) {
+  float y = b0 * x + s->z1;
+  s->z1 = b1 * x - a1 * y + s->z2;
+  s->z2 = b2 * x - a2 * y;
   return y;
 }
 
@@ -334,27 +352,38 @@ static void mp3_task(void *arg) {
       }
     }
 
-    // ---- 9. 高通 + 音量 + 削顶统计 ----
+    // ---- 9. 音色滤波 + 音量 + 削顶统计 ----
     //
-    // 【为什么要高通】这个尺寸的喇叭 200Hz 以下基本没有声压输出，但 D 类功放
-    // 仍然要为那一段低频输出电流（变成热），结果中高频的动态余量被吃掉，
-    // 听感就是"中低音还行、高音糊"。滤掉喇叭放不出的频段能让中高频干净很多。
-    //
-    // 只在采样率变化时重算系数（切歌换了 hz 才需要）。
-    if (!s_hp_ready || s_hp_fs != hz) {
-      hp_init(hz);
-      s_hp_fs = hz;
+    // 滤波只在采样率变化时重算系数（切歌换了 hz 才需要）；
+    // 音色档位是全局变量，设置页随时可以改，下一帧就生效（可以边播边听差别）。
+    if (!s_tone_ready || s_tone_fs != hz) {
+      tone_init(hz);
+      s_tone_fs = hz;
     }
 
     int vol = master_volume;
     if (vol < 0) vol = 0;
     if (vol > 100) vol = 100;
     const float gain = (float)vol / 100.0f;
+    const int   tone = s_tone_mode;
+    const bool  hp_on = (tone != MP3_TONE_FLAT);
+    const bool  lp_on = (tone == MP3_TONE_SOFT);
 
     int32_t peak = 0;
     for (int i = 0; i < samples; i++) {
-      float l = hp_tick(&s_hp_l, (float)pcm[i * 2]) * gain;
-      float r = hp_tick(&s_hp_r, (float)pcm[i * 2 + 1]) * gain;
+      float l = (float)pcm[i * 2];
+      float r = (float)pcm[i * 2 + 1];
+
+      if (hp_on) {
+        l = bq_tick(&s_hp_l, l, s_hp_b0, s_hp_b1, s_hp_b2, s_hp_a1, s_hp_a2);
+        r = bq_tick(&s_hp_r, r, s_hp_b0, s_hp_b1, s_hp_b2, s_hp_a1, s_hp_a2);
+      }
+      if (lp_on) {
+        l = bq_tick(&s_lp_l, l, s_lp_b0, s_lp_b1, s_lp_b2, s_lp_a1, s_lp_a2);
+        r = bq_tick(&s_lp_r, r, s_lp_b0, s_lp_b1, s_lp_b2, s_lp_a1, s_lp_a2);
+      }
+      l *= gain;
+      r *= gain;
 
       int32_t li = (int32_t)l;
       int32_t ri = (int32_t)r;
@@ -428,6 +457,16 @@ int  mp3_current(void)      { return s_cur; }
 bool mp3_is_playing(void)   { return s_active && !s_paused; }
 bool mp3_is_paused(void)    { return s_active && s_paused; }
 int  mp3_progress_pct(void) { return s_progress; }
+
+// 音色档位：只改一个 int，解码任务下一帧读到的就是新值，所以可以边播边切。
+// 滤波器的系数不随档位变（两种模式共用同一组系数），所以切换不会重算、
+// 也不会重置滤波器状态 —— 代价是切换瞬间波形有小跳变，可能听到一声轻咔哒。
+void mp3_set_tone(int mode) {
+  if (mode < 0 || mode >= MP3_TONE_COUNT) return;
+  s_tone_mode = mode;
+}
+
+int mp3_get_tone(void) { return s_tone_mode; }
 
 void mp3_suspend(void) {
   s_active = false;

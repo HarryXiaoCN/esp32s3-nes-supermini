@@ -28,6 +28,18 @@ void mp3_next(void);
 void mp3_prev(void);
 void mp3_stop(void);
 
+// 音色预设（只在 MP3 播放链路上生效；游戏音效不走这条链）
+//   0 = 直通（不滤波，用来听出滤波到底改变了什么）
+//   1 = 默认（180Hz 二阶高通：小喇叭放不出低频，滤掉省电流）
+//   2 = 柔和（默认 + 8kHz 二阶低通：高音刺的时候换柔顺，代价是镲片变糊）
+#define MP3_TONE_FLAT     0
+#define MP3_TONE_DEFAULT  1
+#define MP3_TONE_SOFT     2
+#define MP3_TONE_COUNT    3
+
+void mp3_set_tone(int mode);          // 下一帧起生效，可以边播边切
+int  mp3_get_tone(void);
+
 // 状态查询（给 UI 用，全部是廉价读取）
 int  mp3_current(void);               // 当前曲目索引，-1 = 没有
 bool mp3_is_playing(void);            // 正在放（含暂停态）

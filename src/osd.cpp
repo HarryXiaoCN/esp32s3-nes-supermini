@@ -145,8 +145,10 @@ static int cn_text_width(const char *utf8) {
 //           汉字走 draw_cn_glyph，每个字 16 次 pushImage。
 //           菜单里一行 8 个汉字 = 128 次 SPI 事务，5 行 = 640 次 ——
 //           这正是切页/换选项必须 delay() 遮丑的根本原因。
-//   现在：  整行先渲染进一条 16px 高的内部 RAM 条带，再逐行 pushImage，
+//   第一轮：整行先渲染进一条 16px 高的内部 RAM 条带，再逐行 pushImage，
 //           无论这行有多少字，固定只要 16 次事务（实测约 8 倍提速）。
+//   第二轮：16 行一次拼完、一次推屏。原来 16 次 CASET/RASET/RAMWR 事务
+//           压成 1 次，数据仍然是 w×16×2 字节（3840 像素以内，一次发完）。
 //   ASCII 仍然用 5x7 小字模（7px 宽），这样一行能塞下更长的英文提示；
 //   字模在 16px 行高里垂直居中，和汉字基线对齐。
 static int draw_cn_text(int x, int y, const char *utf8, uint16_t fg, uint16_t bg) {
@@ -165,10 +167,15 @@ static int draw_cn_text(int x, int y, const char *utf8, uint16_t fg, uint16_t bg
   }
   if (w <= 0) return total_w;
 
-  static uint16_t band[DISPLAY_WIDTH];   // 240*2 = 480 字节，内部 RAM
+  // 紧凑布局：第 row 行从 band[row * w * 2] 开始。直接按 SPI 字节序（高字节在前）
+  // 写，推屏时 pushImageBytes() 零转换直发。16*240*2 = 7680 字节内部 RAM。
+  static uint8_t band[CN_GLYPH_H * DISPLAY_WIDTH * 2];
   const int ascii_top = (CN_GLYPH_H - 7) / 2;
+  const uint8_t fg_hi = (uint8_t)(fg >> 8), fg_lo = (uint8_t)(fg & 0xFF);
+  const uint8_t bg_hi = (uint8_t)(bg >> 8), bg_lo = (uint8_t)(bg & 0xFF);
 
   for (int row = 0; row < CN_GLYPH_H; row++) {
+    uint8_t *line = &band[row * w * 2];
     int cx = 0;
     const char *s = utf8;
 
@@ -187,7 +194,8 @@ static int draw_cn_text(int x, int y, const char *utf8, uint16_t fg, uint16_t bg
           int px = cx + c;
           if (px >= w) break;
           bool on = visible && (c < 5) && (pgm_read_byte(&glyph[c]) & (1 << gy));
-          band[px] = on ? fg : bg;
+          line[px * 2]     = on ? fg_hi : bg_hi;
+          line[px * 2 + 1] = on ? fg_lo : bg_lo;
         }
         cx += cw;
       } else {
@@ -204,17 +212,20 @@ static int draw_cn_text(int x, int y, const char *utf8, uint16_t fg, uint16_t bg
           // 字库缺字时画实心方块占位，方便一眼发现漏字
           bool on = g ? ((v & (1u << (CN_GLYPH_W - 1 - c))) != 0)
                       : (row >= 2 && row < CN_GLYPH_H - 2 && c >= 2 && c < CN_GLYPH_W - 2);
-          band[px] = on ? fg : bg;
+          line[px * 2]     = on ? fg_hi : bg_hi;
+          line[px * 2 + 1] = on ? fg_lo : bg_lo;
         }
         cx += CN_GLYPH_W;
       }
     }
 
-    for (int i = cx; i < w; i++) {
-      band[i] = bg;                  // 行尾空出来的部分补背景
+    for (int i = cx; i < w; i++) {          // 行尾空出来的部分补背景
+      line[i * 2]     = bg_hi;
+      line[i * 2 + 1] = bg_lo;
     }
-    tft.pushImage(x, y + row, w, 1, band);
   }
+
+  tft.pushImageBytes(x, y, w, CN_GLYPH_H, band);
 
   return total_w;
 }
@@ -318,14 +329,30 @@ static const char *TXT_MUSIC_PAUSED[LANG_COUNT]  = { "已暂停 %d%%",   "PAUSED
 // 设置页
 static const char *TXT_LANG_ITEM[LANG_COUNT] = { "语言",           "LANGUAGE" };
 static const char *TXT_VOL_ITEM[LANG_COUNT]  = { "音量",           "VOLUME" };
+static const char *TXT_TONE_ITEM[LANG_COUNT] = { "音色",           "TONE" };
+// 音色三档，顺序必须和 mp3_player.h 的 MP3_TONE_FLAT/DEFAULT/SOFT 一致
+static const char *TXT_TONE_VAL[LANG_COUNT][MP3_TONE_COUNT] = {
+  { "原声", "默认", "柔和" },
+  { "FLAT", "DEFAULT", "SOFT" },
+};
+static const char *TXT_LED_ITEM[LANG_COUNT] = { "LED 脚",         "LED PIN" };
+static const char *TXT_LED_VAL[LANG_COUNT][3] = {
+  { "浮空", "拉低", "拉高" },
+  { "HI-Z", "LOW",  "HIGH" },
+};
+// 屏幕 SPI 时钟档位。数值本身是 MHz，两种语言都看得懂，只翻标签。
+// 80M 是"快档"：整屏 23ms → 11.5ms，菜单翻页几乎无感；花屏就切回 40M。
+static const char *TXT_SCR_ITEM[LANG_COUNT] = { "屏幕",           "LCD SPI" };
+static const char *TXT_SCR_VAL[2] = { "40M", "80M" };
 static const char *TXT_HINT_CFG[LANG_COUNT]  = { "上下选 左右调", "L/R ADJUST" };
-// iOS 的 section footer：说明这个分组什么时候生效
-static const char *TXT_CFG_NOTE[LANG_COUNT]  = { "下次进入游戏时生效", "TAKES EFFECT NEXT LAUNCH" };
 
 // NVS 里存的键名与命名空间
 #define PREFS_NAMESPACE "nes"
 #define PREFS_KEY_LANG  "lang"
 #define PREFS_KEY_VOL   "vol"
+#define PREFS_KEY_TONE  "tone"
+#define PREFS_KEY_LED   "led"
+#define PREFS_KEY_SPI   "spi"
 
 // 读取已保存的语言。返回 -1 表示还没选过（首次开机）。
 static int load_lang_from_nvs() {
@@ -371,6 +398,107 @@ static void save_volume_to_nvs(int v) {
   prefs.end();
 }
 
+// 音色档位持久化。返回 -1 表示还没保存过（用 mp3_player 里的默认值）。
+static int load_tone_from_nvs() {
+  Preferences prefs;
+  if (!prefs.begin(PREFS_NAMESPACE, true)) {
+    return -1;
+  }
+  int v = prefs.getInt(PREFS_KEY_TONE, -1);
+  prefs.end();
+  if (v < 0 || v >= MP3_TONE_COUNT) return -1;
+  return v;
+}
+
+static void save_tone_to_nvs(int v) {
+  Preferences prefs;
+  if (!prefs.begin(PREFS_NAMESPACE, false)) {
+    return;
+  }
+  prefs.putInt(PREFS_KEY_TONE, v);
+  prefs.end();
+}
+
+// 板载 LED 手动测试档：0 浮空（默认，不驱动）/ 1 拉低 / 2 拉高。
+//
+// 官方 wiki 写的是"板载 RGB 和蓝色 LED 共用 GPIO48"，示例注释里 HIGH=灭、LOW=亮
+// （低电平点亮）。但实测把 48 拉低时那颗红灯灭了、充电指示的蓝灯照闪，和 wiki
+// 对不上——所以留这一档在设置页里，你可以改一下看哪颗灯真的跟着变，
+// 顺便确认闪烁的蓝灯到底归不归它管。
+int menu_led = 0;
+
+static void led_pin_apply(int mode) {
+  if (mode < 0 || mode > 2) mode = 0;
+  menu_led = mode;
+  if (mode == 0) {
+    pinMode(HW_LED_PIN, INPUT);                  // 高阻 = 恢复上电常态，不驱动
+  } else {
+    pinMode(HW_LED_PIN, OUTPUT);
+    digitalWrite(HW_LED_PIN, mode == 1 ? LOW : HIGH);
+  }
+  Serial.printf("[CFG] LED pin %d -> %s\n", HW_LED_PIN,
+                mode == 0 ? "HI-Z" : (mode == 1 ? "LOW" : "HIGH"));
+}
+
+static int load_led_from_nvs() {
+  Preferences prefs;
+  if (!prefs.begin(PREFS_NAMESPACE, true)) {
+    return -1;
+  }
+  int v = prefs.getInt(PREFS_KEY_LED, -1);
+  prefs.end();
+  if (v < 0 || v > 2) return -1;
+  return v;
+}
+
+static void save_led_to_nvs(int v) {
+  Preferences prefs;
+  if (!prefs.begin(PREFS_NAMESPACE, false)) {
+    return;
+  }
+  prefs.putInt(PREFS_KEY_LED, v);
+  prefs.end();
+}
+
+// 屏幕 SPI 时钟档位：0 = 40MHz（保守）/ 1 = 80MHz（默认，快）。
+//
+// 【为什么做成设置项而不是写死】80MHz 在焊接短线上通常没问题，但屏幕和 SD 卡
+// 共享 SCK/MOSI，能不能稳跑取决于实际走线、卡座和屏排线的寄生参数。给用户一个
+// 运行时开关，比在固件里猜安全：40MHz 一定稳，80MHz 快一倍（整屏 23ms → 11.5ms）。
+// 80MHz 是 ESP32-S3 SPI 主机的硬件上限（APB 80MHz），请求更高频率驱动会自动
+// 钳到 80MHz，不会更快，所以设置页只给这两档。
+//
+// 【防花屏兜底】开机时按住 B 会强制回 40MHz 并写回 NVS —— 80MHz 万一花屏到
+// 看不清菜单，这是不看屏幕也能恢复的唯一办法。
+int menu_spi = 1;                  // 默认 80MHz；NVS 里存过就以 NVS 为准
+
+static int load_spi_from_nvs() {
+  Preferences prefs;
+  if (!prefs.begin(PREFS_NAMESPACE, true)) {
+    return -1;
+  }
+  int v = prefs.getInt(PREFS_KEY_SPI, -1);
+  prefs.end();
+  if (v < 0 || v > 1) return -1;
+  return v;
+}
+
+static void save_spi_to_nvs(int v) {
+  Preferences prefs;
+  if (!prefs.begin(PREFS_NAMESPACE, false)) {
+    return;
+  }
+  prefs.putInt(PREFS_KEY_SPI, v);
+  prefs.end();
+}
+
+static void spi_freq_apply(int mode) {
+  menu_spi = (mode == 1) ? 1 : 0;
+  // 下一次 SPI 事务就按新时钟走，不需要重新初始化面板
+  tft.set_spi_freq(menu_spi ? 80000000u : 40000000u);
+  Serial.printf("[CFG] LCD SPI -> %u MHz\n", menu_spi ? 80u : 40u);
+}
+
 // 圆角矩形填充。半径很小时用圆弧逐行计算即可，菜单绘制频率低，不影响帧率。
 static void fill_round_rect(int x, int y, int w, int h, int r, uint16_t color) {
   if (w <= 0 || h <= 0) return;
@@ -398,12 +526,20 @@ static void fill_round_rect(int x, int y, int w, int h, int r, uint16_t color) {
   }
 }
 
-// 右侧的 ">" chevron 指示符
-static void draw_chevron(int x, int y, uint16_t color) {
-  for (int i = 0; i < 5; i++) {
-    tft.drawFilledRect(x + i, y + i, 1, 1, color);
-    tft.drawFilledRect(x + i, y + 8 - i, 1, 1, color);
+// 右侧的 ">" chevron 指示符。
+//
+// 原来每个点一次 1×1 drawFilledRect —— 一个 chevron 10 个像素就是 10 次完整
+// SPI 窗口事务，游戏列表 5 行 = 50 次事务只为 50 个像素。现在拼成 5×9 小图
+// 一次推完；bg 必须一起传，因为推图会覆盖整个矩形（不能留透明像素）。
+static void draw_chevron(int x, int y, uint16_t color, uint16_t bg) {
+  static uint16_t buf[9 * 5];
+  for (int r = 0; r < 9; r++) {
+    for (int c = 0; c < 5; c++) {
+      bool on = (r < 5) ? (c == r) : (c == 8 - r);
+      buf[r * 5 + c] = on ? color : bg;
+    }
   }
+  tft.pushImage(x, y, 5, 9, buf);
 }
 
 // ============================================================================
@@ -434,6 +570,21 @@ static void ui_page(const char *title, const char *trailing, bool centered) {
   }
 }
 
+// 切页时清掉"卡片区域以外"的背景。
+//
+// 【为什么不整屏 fillScreen】整屏 115200 字节 / 40MHz = 23ms，其中卡片矩形
+// （y=40..card_bottom、宽 220）随后一定会被 ui_group() 完整覆盖 —— 那 72KB
+// 属于白刷。改成只刷「页签那一行 + 卡片下面那一条」，数据量降到 40KB。
+//
+// 三个满页的卡片都从 x=UI_PAGE_PAD 开始、宽度相同，卡片左右两侧（x<10、x>229）
+// 在旧页面上也没有任何内容，所以左右两列不用清。
+static void ui_clear_around_cards(int card_bottom) {
+  tft.drawFilledRect(0, 0, DISPLAY_WIDTH, UI_GROUP_Y, UI_BG);
+  if (card_bottom < DISPLAY_HEIGHT) {
+    tft.drawFilledRect(0, card_bottom, DISPLAY_WIDTH, DISPLAY_HEIGHT - card_bottom, UI_BG);
+  }
+}
+
 // 顶层页签：游戏 / 音乐 / 设置。
 //
 // 【为什么放顶部而不是 iOS 标准的底部 Tab Bar】
@@ -441,8 +592,15 @@ static void ui_page(const char *title, const char *trailing, bool centered) {
 //   391 个游戏的翻页成本直接上去。这一行本来只放一个标题，拿来当页签等于白赚。
 //
 // 选中页签：主文字色 + 下方 2px 系统蓝指示条；未选中：次要文字色。
-static void ui_page_tabs(int active, const char *trailing) {
-  tft.fillScreen(UI_BG);
+//
+// card_bottom：本页分组卡片的底边 y。<0 表示"整屏清"——空状态页的卡片位置
+// （ey=84）和三个满页不一样，靠局部清屏会留下旧内容的残影，那种页必须全清。
+static void ui_page_tabs(int active, const char *trailing, int card_bottom = -1) {
+  if (card_bottom < 0) {
+    tft.fillScreen(UI_BG);
+  } else {
+    ui_clear_around_cards(card_bottom);
+  }
 
   int x = UI_TITLE_X;
   for (int i = 0; i < PAGE_COUNT; i++) {
@@ -525,8 +683,15 @@ static void ui_group(int y, int rows, int row_h) {
 //   value   ：右侧对齐的次要文字（可为 NULL）
 //   chevron ：右侧 ">" 指示（可为 NULL 行为）
 //   sep     ：本行下方是否画分隔线 —— 由调用方判断，避免画到下一行的圆角上
+//   bg_covered：调用方保证「这行背后已经是卡片底色」—— 首次绘制刚填过整卡，
+//               或者翻页时卡片底根本没动。此时非选中行只清文字会落到的
+//               216×16 区域，省掉整行 216×32 = 13.8KB 的重复写入。
+//               选中行仍然整行画高亮（高亮本来就要盖住整行）。
+//               注意：调用方必须保证「这行上一次也不是选中」—— 旧的高亮
+//               圆角有 8px 高，不在 16px 文字带里，只能靠整行覆盖恢复。
 static void ui_row(int y, int h, bool sel, const char *label,
-                   const char *value, bool chevron, bool sep) {
+                   const char *value, bool chevron, bool sep,
+                   bool bg_covered = false) {
   const int x = UI_PAGE_PAD;
   const int w = DISPLAY_WIDTH - 2 * UI_PAGE_PAD;
   const int ty = y + (h - CN_GLYPH_H) / 2;   // 统一基线，不再 y+8 / y+9 / y+14
@@ -535,6 +700,16 @@ static void ui_row(int y, int h, bool sel, const char *label,
     fill_round_rect(x + UI_ROW_INSET, y, w - 2 * UI_ROW_INSET, h, UI_ROW_R, UI_CARD_SEL);
     int bar_h = UI_BAR_H(h);
     fill_round_rect(x + UI_BAR_INSET, y + (h - bar_h) / 2, UI_BAR_W, bar_h, 2, UI_ACCENT);
+  } else if (bg_covered) {
+    // 卡片底色没变，只清文字/value/chevron 的矩形带。
+    // 上一屏更长的文字必须被覆盖：按整段可用宽度清，而不是只清新文字宽度。
+    tft.drawFilledRect(x + UI_ROW_PAD, ty,
+                       w - UI_ROW_PAD - UI_ROW_END + 1, CN_GLYPH_H, UI_CARD);
+    if (!sep) {
+      // 这行没有分隔线：把上一屏可能留下的那条 1px 线也擦掉
+      tft.drawFilledRect(x + UI_ROW_PAD, y + h - 1,
+                         w - UI_ROW_PAD - UI_ROW_END, 1, UI_CARD);
+    }
   } else {
     // 必须用卡片底色覆盖，绝不能用背景黑 —— 那会先看到"擦掉再重画"闪一下
     tft.drawFilledRect(x + UI_ROW_INSET, y, w - 2 * UI_ROW_INSET, h, UI_CARD);
@@ -551,7 +726,7 @@ static void ui_row(int y, int h, bool sel, const char *label,
     draw_cn_text(x + w - UI_ROW_END - vw, ty, value, sel ? UI_ACCENT : UI_TXT2, bg);
   }
   if (chevron) {
-    draw_chevron(x + w - UI_ROW_END - 4, y + (h - 9) / 2, UI_TXT2);
+    draw_chevron(x + w - UI_ROW_END - 4, y + (h - 9) / 2, UI_TXT2, bg);
   }
   if (sep && !sel) {
     tft.drawFilledRect(x + UI_ROW_PAD, y + h - 1, w - UI_ROW_PAD - UI_ROW_END, 1, UI_SEP);
@@ -688,6 +863,20 @@ static void show_language_picker() {
 // 由 .ino 在 tft.init() 之后、show_menu() 之前调用。
 // 已经保存过语言就直接用，否则弹一次选择界面。
 extern "C" void osd_ui_language_setup(void) {
+  // 先应用屏幕 SPI 时钟档位：tft.init() 已经跑完，按键也已初始化，
+  // 而且这个值会影响后面所有页面的绘制速度，越早设越好。
+  //
+  // 兜底：开机时按住 B = 强制 40MHz 并写回 NVS。80MHz 万一在用户自己的
+  // 走线上花屏到看不清菜单，这是唯一不依赖屏幕的恢复路径。
+  int saved_spi = load_spi_from_nvs();
+  if (nes_get_gamepad_state() & HW_MASK_B) {
+    saved_spi = 0;
+    save_spi_to_nvs(0);
+    Serial.println("[CFG] 开机检测到 B 键按住 -> 屏幕时钟强制回 40MHz");
+  }
+  if (saved_spi < 0) saved_spi = 1;    // 没存过：默认 80MHz（SPI 硬件上限）
+  spi_freq_apply(saved_spi);
+
   int saved = load_lang_from_nvs();
   if (saved >= 0) {
     ui_lang = (ui_lang_t)saved;
@@ -917,6 +1106,7 @@ static bool game_list_reserve(int need) {
 }
 
 int menu_volume = 100;
+int menu_tone   = MP3_TONE_DEFAULT;
 
 static bool has_nes_suffix(const char *name) {
   size_t n = strlen(name);
@@ -1031,8 +1221,14 @@ extern "C" int osd_game_count(void) {
 // 调整立即写 NVS，下次开机保持。
 // ---------------- 设置页（顶层页签之一）----------------
 static void page_settings_loop(void) {
-  const int ROWS = 2;
-  const int y0 = UI_GROUP_Y;
+  // 五行：语言 / 音量 / 音色 / LED 脚 / 屏幕（SPI 时钟档）。
+  // 行高收到 UI_ROW_H(32)：5×32+4 = 164，卡片落在 40..203，和游戏列表完全对齐，
+  // footer 从 y=204 开始清屏，刚好不重叠。
+  const int ROWS  = 5;
+  const int ROW_H = UI_ROW_H;
+  const int y0    = UI_GROUP_Y;
+  // 本页卡片底边（局部清屏用，见 ui_page_tabs）
+  const int card_bottom = y0 + ROW_H * ROWS + UI_ROW_GAP;
 
   // 音量离散条：10 格，每格 10%。比连续滑块更适合只有左右两个按键的设备，
   // 也比纯数字直观。起点要避开最长的标签（英文 "VOLUME" = 6*7 = 42px）。
@@ -1042,26 +1238,38 @@ static void page_settings_loop(void) {
   const int seg_gap = 2;
   const int bar_h   = 8;
 
-  int sel = 0;
-  bool dirty = true;
+  int  sel       = 0;
+  int  last_sel  = -1;
+  bool dirty_all = true;        // 首次进入 / 语言切换 / 频率切换：整页重画
+  int  dirty_row = -1;          // 值变化：只刷这一行
   bool first_paint = true;
 
   auto draw_row = [&](int i, bool on) {
-    int y = y0 + UI_ROW_INSET + i * UI_ROW_TALL;
+    int y = y0 + UI_ROW_INSET + i * ROW_H;
     bool sep = (i < ROWS - 1) && !(i + 1 == sel);
 
-    const char *label = (i == 0) ? TXT_LANG_ITEM[ui_lang] : TXT_VOL_ITEM[ui_lang];
+    const char *label = (i == 0) ? TXT_LANG_ITEM[ui_lang]
+                      : (i == 1) ? TXT_VOL_ITEM[ui_lang]
+                      : (i == 2) ? TXT_TONE_ITEM[ui_lang]
+                      : (i == 3) ? TXT_LED_ITEM[ui_lang]
+                                 : TXT_SCR_ITEM[ui_lang];
     char val[16];
     if (i == 0) {
       snprintf(val, sizeof(val), "%s", ui_lang == LANG_ZH ? "中文" : "English");
-    } else {
+    } else if (i == 1) {
       snprintf(val, sizeof(val), "%d%%", menu_volume);
+    } else if (i == 2) {
+      snprintf(val, sizeof(val), "%s", TXT_TONE_VAL[ui_lang][menu_tone]);
+    } else if (i == 3) {
+      snprintf(val, sizeof(val), "%s", TXT_LED_VAL[ui_lang][menu_led]);
+    } else {
+      snprintf(val, sizeof(val), "%s", TXT_SCR_VAL[menu_spi]);
     }
 
-    ui_row(y, UI_ROW_TALL, on, label, val, false, sep);
+    ui_row(y, ROW_H, on, label, val, false, sep);
 
     if (i == 1) {
-      int by = y + (UI_ROW_TALL - bar_h) / 2;
+      int by = y + (ROW_H - bar_h) / 2;
       int filled = (menu_volume + 5) / 10;   // 0..10 格
       for (int s = 0; s < 10; s++) {
         uint16_t c = (s < filled) ? UI_ACCENT : UI_TXT3;
@@ -1070,19 +1278,26 @@ static void page_settings_loop(void) {
     }
   };
 
+  // 上下移动改变选中行时，选中行**上一行**的分隔线状态也会变（选中行上方
+  // 不画线，避免压到高亮圆角），但那一行的内容完全没变。单独补一条 1px 线，
+  // 不要为了它把整行 13.8KB 重刷一遍。
+  auto draw_sep_line = [&](int i) {
+    if (i < 0 || i >= ROWS || i == sel) return;
+    int y = y0 + UI_ROW_INSET + i * ROW_H;
+    bool sep = (i < ROWS - 1) && !(i + 1 == sel);
+    tft.drawFilledRect(UI_PAGE_PAD + UI_ROW_PAD, y + ROW_H - 1,
+                       DISPLAY_WIDTH - 2 * UI_PAGE_PAD - UI_ROW_PAD - UI_ROW_END, 1,
+                       sep ? UI_SEP : UI_CARD);
+  };
+
   ui_input_reset();   // 以当前按键状态为基准，仍按着的 SELECT 不算新的按下
 
   for (;;) {
-    if (dirty) {
-      // 只有第一次进来才全屏清一次；之后调值/换选项只重绘两行，
-      // 否则每按一下都全屏重绘（115KB / 约 23ms）会明显闪。
+    if (dirty_all) {
+      // 整页重画：只在首次进入、语言变化、SPI 频率变化时走这里
       if (first_paint) {
-        ui_page_tabs(PAGE_SETTINGS, NULL);
-        ui_group(y0, ROWS, UI_ROW_TALL);
-        // iOS 的 section footer 说明：解释这个分组的行为，顺便填掉卡片下方的空白
-        draw_cn_text(UI_PAGE_PAD + UI_ROW_PAD,
-                     y0 + ROWS * UI_ROW_TALL + UI_ROW_GAP + 12,
-                     TXT_CFG_NOTE[ui_lang], UI_TXT2, UI_BG);
+        ui_page_tabs(PAGE_SETTINGS, NULL, card_bottom);
+        ui_group(y0, ROWS, ROW_H);
         // footer 文案只在语言变化时才需要重画，不要跟着每次调值一起刷
         ui_page_footer(TXT_HINT_CFG[ui_lang], TXT_NAV_SELECT[ui_lang]);
         first_paint = false;
@@ -1091,7 +1306,21 @@ static void page_settings_loop(void) {
       for (int i = 0; i < ROWS; i++) {
         draw_row(i, i == sel);
       }
-      dirty = false;
+      last_sel  = sel;
+      dirty_row = -1;
+      dirty_all = false;
+    } else if (last_sel != sel) {
+      // 上下切换：只有两行的选中态变了，其余 3 行内容完全一样 ——
+      // 重画它们等于每按一下白刷 41KB。和游戏列表同一套思路。
+      draw_row(last_sel, false);
+      draw_row(sel, true);
+      draw_sep_line(last_sel - 1);
+      draw_sep_line(sel - 1);
+      last_sel = sel;
+    } else if (dirty_row >= 0) {
+      // 左右调值：只刷被调的那一行（音量行会连进度条一起重画）
+      draw_row(dirty_row, dirty_row == sel);
+      dirty_row = -1;
     }
 
     uint8_t hw = ui_input_poll();
@@ -1100,11 +1329,9 @@ static void page_settings_loop(void) {
     // 凑巧能用）。这里改成真正的上一项/下一项。
     if (hw & HW_MASK_UP) {
       sel = (sel + ROWS - 1) % ROWS;
-      dirty = true;
     }
     if (hw & HW_MASK_DOWN) {
       sel = (sel + 1) % ROWS;
-      dirty = true;
     }
     if (hw & (HW_MASK_LEFT | HW_MASK_RIGHT)) {
       int dir = (hw & HW_MASK_LEFT) ? -1 : 1;
@@ -1112,21 +1339,43 @@ static void page_settings_loop(void) {
         ui_lang = (ui_lang_t)((ui_lang + LANG_COUNT + dir) % LANG_COUNT);
         save_lang_to_nvs(ui_lang);
         first_paint = true;   // 界面语言变了，标题/标签/footer 全要重画
-      } else {
+        dirty_all = true;
+      } else if (sel == 1) {
         menu_volume += dir * 10;
         if (menu_volume < 0) menu_volume = 0;
         if (menu_volume > 100) menu_volume = 100;
         master_volume = menu_volume;
         save_volume_to_nvs(menu_volume);
+        dirty_row = sel;
+      } else if (sel == 2) {
+        // 音色：立即生效。音乐可以一边放一边切到设置页，左右直接 A/B
+        menu_tone = (menu_tone + MP3_TONE_COUNT + dir) % MP3_TONE_COUNT;
+        mp3_set_tone(menu_tone);
+        save_tone_to_nvs(menu_tone);
+        Serial.printf("[CFG] 音色 -> %d\n", menu_tone);
+        dirty_row = sel;
+      } else if (sel == 3) {
+        // LED 脚：浮空 / 拉低 / 拉高。改完立刻看板子上哪颗灯跟着变
+        menu_led = (menu_led + 3 + dir) % 3;
+        led_pin_apply(menu_led);
+        save_led_to_nvs(menu_led);
+        dirty_row = sel;
+      } else {
+        // 屏幕 SPI 时钟：40M ↔ 80M，立即生效。
+        // 切完必须整页重画一遍：万一 80M 花屏，按一下切回 40M 时画面要能自己恢复，
+        // 而不是停在花屏帧上等用户盲操作。
+        spi_freq_apply(1 - menu_spi);
+        save_spi_to_nvs(menu_spi);
+        first_paint = true;
+        dirty_all = true;
       }
-      dirty = true;
     }
 
     // SELECT 切到下一个页面、B 切到上一个页面（设置页没有"返回"语义了，
     // 它就是三个顶层页面之一）。
     if (ui_page_switch(hw)) {
-      Serial.printf("[MENU] settings -> page %d (lang=%d vol=%d)\n",
-                    (int)g_page, (int)ui_lang, menu_volume);
+      Serial.printf("[MENU] settings -> page %d (lang=%d vol=%d tone=%d led=%d spi=%d)\n",
+                    (int)g_page, (int)ui_lang, menu_volume, menu_tone, menu_led, menu_spi);
       return;
     }
 
@@ -1174,6 +1423,7 @@ static int page_games_loop(void) {
   // 从设置页回来时光标还停在刚才那款游戏上，不用重新翻。
   static int  top_index = 0;
   static int  last_selected = -1;
+  static int  last_top = 0;      // 上次绘制时的滚动窗口起点（算旧选中行位置用）
   static bool needs_full_redraw = true;
   static bool needs_list_redraw = false;
   static bool games_first = true;
@@ -1202,24 +1452,34 @@ static int page_games_loop(void) {
 
   auto row_y = [](int si) { return UI_GROUP_Y + UI_ROW_INSET + si * UI_ROW_H; };
 
-  // 单行重绘：只覆盖这一行，用于选中项移动，避免整块刷新造成的闪屏
-  auto draw_one_row = [&](int si, bool sel) {
+  // 单行重绘：只覆盖这一行，用于选中项移动，避免整块刷新造成的闪屏。
+  //   bg_covered：这行背后已经是卡片底色（首次绘制刚填过整卡，或者翻页时
+  //               卡片底根本没动）。此时非选中行只清 16px 高的文字带；
+  //               「上一次是选中、这一次不是」的行必须整行覆盖 —— 高亮圆角
+  //               有 8px 高，不在文字带里，只清文字带会留下高亮残角。
+  auto draw_one_row = [&](int si, bool sel, bool bg_covered) {
     int n = visible_rows();
     if (si < 0 || si >= n) return;
     int gi = top_index + si;
     // 分隔线不能画到下一行的选中圆角上
     bool sep = (si < n - 1) && !((top_index + si + 1) == game_list.selected);
-    ui_row(row_y(si), UI_ROW_H, sel, game_list.names[gi], NULL, true, sep);
+    ui_row(row_y(si), UI_ROW_H, sel, game_list.names[gi], NULL, true, sep, bg_covered);
   };
 
-  // 整块重绘。注意用卡片底色覆盖，绝不能用背景黑清空 ——
-  // 那样会先看到一次"擦掉再重画"，表现就是切换选项闪一下黑。
-  auto draw_list = [&]() {
+  // 整块重绘。
+  //   card_bg   ：是否重画卡片底。首次绘制（fillScreen 之后）必须画；翻页时
+  //               卡片底完全没变 —— 391 个游戏里它始终是同样位置同样大小的
+  //               深灰圆角块，重画等于把 72KB 原样再写一遍。
+  //   restore_si：上一次是选中、这一次不再是的那一行（屏幕内行号）。
+  auto draw_list = [&](bool card_bg, int restore_si) {
     int n = visible_rows();
     if (n <= 0) return;
-    ui_group(UI_GROUP_Y, n, UI_ROW_H);
+    if (card_bg) {
+      ui_group(UI_GROUP_Y, n, UI_ROW_H);
+    }
     for (int i = 0; i < n; i++) {
-      draw_one_row(i, (top_index + i) == game_list.selected);
+      bool covered = (i != restore_si);
+      draw_one_row(i, (top_index + i) == game_list.selected, covered);
     }
   };
 
@@ -1235,30 +1495,40 @@ static int page_games_loop(void) {
     if (needs_full_redraw) {
       char cnt[8];
       snprintf(cnt, sizeof(cnt), "%d", game_list.count);
-      ui_page_tabs(PAGE_GAMES, cnt);
+      ui_page_tabs(PAGE_GAMES, cnt, UI_GROUP_Y + UI_ROW_H * VISIBLE_ROWS + UI_ROW_GAP);
       ui_page_footer(TXT_HINT[ui_lang], TXT_NAV_SELECT[ui_lang]);
-      draw_list();
+      draw_list(true, -1);      // ui_page_tabs 里刚 fillScreen 过，卡片底要画
       draw_scroll();
 
       last_selected = game_list.selected;
+      last_top = top_index;
       needs_full_redraw = false;
       needs_list_redraw = false;
     } else if (needs_list_redraw) {
-      draw_list();
+      // 翻页（滚动一屏）。卡片底没有变化，跳过它；只剩
+      // 「上一次是选中、这一次不是」的那一行需要整行覆盖。
+      // 只有滚到末尾、可见行数不足满屏时，卡片高度变了，卡片底才必须重画。
+      int n = visible_rows();
+      int old_si = last_selected - last_top;
+      int new_si = game_list.selected - top_index;
+      int restore_si = (old_si >= 0 && old_si < n && old_si != new_si) ? old_si : -1;
+      draw_list(n != VISIBLE_ROWS, restore_si);
       draw_scroll();
       last_selected = game_list.selected;
+      last_top = top_index;
       needs_list_redraw = false;
     } else if (last_selected != game_list.selected) {
       // 只重绘变化的这两行，其余行不动 —— 这是消除切换闪烁的关键
       int n = visible_rows();
       if (last_selected >= top_index && last_selected < top_index + n) {
-        draw_one_row(last_selected - top_index, false);
+        draw_one_row(last_selected - top_index, false, false);
       }
       if (game_list.selected >= top_index && game_list.selected < top_index + n) {
-        draw_one_row(game_list.selected - top_index, true);
+        draw_one_row(game_list.selected - top_index, true, false);
       }
       draw_scroll();
       last_selected = game_list.selected;
+      last_top = top_index;
     }
 
     uint8_t hw = ui_input_poll();
@@ -1387,7 +1657,7 @@ static void page_music_loop(void) {
     return UI_TXT2;
   };
 
-  auto draw_row = [&](int si, bool is_sel) {
+  auto draw_row = [&](int si, bool is_sel, bool bg_covered) {
     int top = top_of();
     int gi = top + si;
     int y = UI_GROUP_Y + UI_ROW_INSET + si * UI_ROW_H;
@@ -1396,7 +1666,7 @@ static void page_music_loop(void) {
 
     // 只让 ui_row 画背景和分隔线，文字自己画：ui_row 的 label 只有
     // "选中/未选中"两种颜色，而"正在播放但没选中"需要第三种（强调色）。
-    ui_row(y, UI_ROW_H, is_sel, "", NULL, false, sep);
+    ui_row(y, UI_ROW_H, is_sel, "", NULL, false, sep, bg_covered);
     // 曲名是变长内容，必须按可用宽度截断 —— 否则长名换短名会在右侧留残影
     int max_px = DISPLAY_WIDTH - 2 * UI_PAGE_PAD - UI_ROW_PAD - UI_ROW_END;
     draw_text_fit(UI_PAGE_PAD + UI_ROW_PAD, ty, mp3_name(gi), max_px,
@@ -1409,11 +1679,17 @@ static void page_music_loop(void) {
                  total, VISIBLE_ROWS, top_of());
   };
 
-  auto draw_list = [&]() {
-    ui_group(UI_GROUP_Y, VISIBLE_ROWS, UI_ROW_H);
+  // 整块重绘。card_bg=false 表示卡片底没动（翻页/换播放态），跳过 72KB 的
+  // 重复填充；restore_si 是「上次选中、这次不再选中」的屏幕行号，必须整行覆盖
+  // （高亮圆角在 16px 文字带之外）。参数语义和游戏列表一致。
+  auto draw_list = [&](bool card_bg, int restore_si) {
+    if (card_bg) {
+      ui_group(UI_GROUP_Y, VISIBLE_ROWS, UI_ROW_H);
+    }
     int top = top_of();
     for (int i = 0; i < VISIBLE_ROWS; i++) {
-      draw_row(i, (top + i) == sel);
+      bool covered = (i != restore_si);
+      draw_row(i, (top + i) == sel, covered);
     }
     draw_scroll();
   };
@@ -1437,8 +1713,8 @@ static void page_music_loop(void) {
   char trailing[8];
   snprintf(trailing, sizeof(trailing), "%d", total);
 
-  ui_page_tabs(PAGE_MUSIC, trailing);
-  draw_list();
+  ui_page_tabs(PAGE_MUSIC, trailing, UI_GROUP_Y + UI_ROW_H * VISIBLE_ROWS + UI_ROW_GAP);
+  draw_list(true, -1);          // 刚 fillScreen 过，卡片底要画
   draw_status();
 
   last_cur  = mp3_current();
@@ -1487,13 +1763,21 @@ static void page_music_loop(void) {
         // 游戏列表早就是这么做的（只画变化的 2 行），音乐页之前偷懒了。
         int top = top_of();
         if (top != last_top || last_sel < 0) {
-          draw_list();                       // 翻页了，整块必须重画
+          // 翻页了：卡片底没变，只重画行；旧选中行如果换到了别的屏幕行，
+          // 那一行必须整行覆盖（高亮圆角不在 16px 文字带里）。
+          int n = total - top;
+          if (n > VISIBLE_ROWS) n = VISIBLE_ROWS;
+          int old_si = last_sel - last_top;
+          int new_si = sel - top;
+          int restore_si = (old_si >= 0 && old_si < n && old_si != new_si) ? old_si : -1;
+          draw_list(n != VISIBLE_ROWS, restore_si);   // 不满屏时卡片高度会变，得重画卡片底
         } else if (last_sel != sel) {
-          draw_row(last_sel - top, false);   // 取消选中
-          draw_row(sel - top, true);         // 新选中
-          draw_scroll();                     // 只画了两行，滚动条得单独更新
+          draw_row(last_sel - top, false, false);   // 取消选中（整行恢复）
+          draw_row(sel - top, true, false);         // 新选中（整行高亮）
+          draw_scroll();                            // 只画了两行，滚动条得单独更新
         } else {
-          draw_list();                       // 播放态变化，颜色要跟着换
+          // 播放态变化：颜色要跟着换，但卡片底没变
+          draw_list(false, -1);
         }
         last_sel = sel;
         last_top = top;
@@ -1526,6 +1810,20 @@ extern "C" int show_menu() {
       menu_volume = v;
       master_volume = v;
       Serial.printf("[CFG] 音量恢复: %d%%\n", v);
+    }
+    // 音色档位同理：必须在第一次进设置页/开始播放之前就恢复，
+    // 否则用户会觉得"音色没存档"。
+    int t = load_tone_from_nvs();
+    if (t >= 0) {
+      menu_tone = t;
+      mp3_set_tone(t);
+      Serial.printf("[CFG] 音色恢复: %d\n", t);
+    }
+    // LED 手动测试档：0（浮空）是默认态，不需要动引脚；>0 才真正驱动
+    int l = load_led_from_nvs();
+    if (l > 0) {
+      led_pin_apply(l);
+      Serial.printf("[CFG] LED 档位恢复: %d\n", l);
     }
   }
 
