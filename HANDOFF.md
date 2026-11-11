@@ -291,7 +291,7 @@ $sp.RtsEnable = $true; Start-Sleep -Milliseconds 150; $sp.RtsEnable = $false   #
 | esptool | `$env:USERPROFILE\.espressif\python_env\idf6.1_py3.14_env\Scripts\esptool.exe` |
 | Python | 3.14（esptool/字库脚本用）；系统还有 3.10 / 3.11 |
 | ESP-IDF | v6.1 已装在 `G:\Espressif\esp-idf-v6.1`（非必须，仅提供 esptool） |
-| 代理 | 本机 HTTP 代理（访问 GitHub 用；git 需配 `http.sslBackend=openssl`） |
+| 代理 | Clash Verge（verge-mihomo），混合端口 `127.0.0.1:7900`。`http.sslBackend=openssl` 已配。**git push 必须走 SOCKS5**（走 HTTP 代理会 `408` / `curl 52 Empty reply`）：<br>`git -c http.proxy=socks5h://127.0.0.1:7900 -c https.proxy=socks5h://127.0.0.1:7900 -c http.version=HTTP/1.1 push origin master` |
 | GitHub 账号 | `HarryXiaoCN`（凭据已存 Windows 凭据管理器） |
 
 ---
